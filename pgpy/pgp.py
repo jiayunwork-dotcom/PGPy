@@ -39,6 +39,7 @@ from .constants import SecurityIssues
 from .decorators import KeyAction
 
 from .errors import PGPDecryptionError
+from .errors import PGPEncryptionError
 from .errors import PGPError
 
 from .packet import Key
@@ -862,6 +863,101 @@ class PGPUID(ParentRef):
 
 
 class PGPMessage(Armorable, PGPObject):
+    # key usage flags that mark a key component as usable for encrypting data
+    _ENCRYPTION_KEY_FLAGS = {KeyFlags.EncryptCommunications, KeyFlags.EncryptStorage}
+
+    @staticmethod
+    def _has_encryption_flags(pgpkey):
+        try:
+            return bool(PGPMessage._ENCRYPTION_KEY_FLAGS & pgpkey._get_key_flags())
+        except (PGPError, StopIteration):
+            # a subkey with no binding signature, or otherwise unusable key flags
+            return False
+
+    @classmethod
+    def _select_encryption_key(cls, pgpkey):
+        """
+        Select the actual key component of ``pgpkey`` that an outgoing PKESK should be wrapped to.
+
+        If a primary key is supplied, its own usage flags are honored first; if the primary key
+        is not marked for encryption, the first encryption-capable subkey is used. A key that
+        is already a subkey is simply validated and returned.
+
+        :raises: :py:exc:`~errors.PGPEncryptionError` if no encryption-capable, RSA component exists
+        """
+        if not pgpkey.is_primary:
+            candidate = pgpkey
+        elif cls._has_encryption_flags(pgpkey):
+            candidate = pgpkey
+        else:
+            candidate = next((sk for sk in pgpkey.subkeys.values() if cls._has_encryption_flags(sk)), None)
+            if candidate is None:
+                raise PGPEncryptionError("Key 0x{:s} has no encryption-capable component".format(pgpkey.fingerprint.keyid))
+
+        if candidate.key_algorithm != PubKeyAlgorithm.RSAEncryptOrSign:
+            raise PGPEncryptionError(
+                "Multi-recipient encryption currently only supports RSA keys; "
+                "0x{:s} uses {:s}".format(candidate.fingerprint.keyid, candidate.key_algorithm.name))
+
+        return candidate
+
+    @staticmethod
+    def _key_cipher_preferences(pgpkey):
+        """
+        Return the preferred symmetric algorithms advertised by the primary key's most recently
+        self-signed User ID. Preferences live on User ID self-signatures of the primary key,
+        so a subkey is resolved to its parent first.
+
+        A key with no User ID or no cipher preferences is treated per RFC 4880 as preferring
+        only TripleDES. Only algorithms this library can actually execute survive the filter.
+        """
+        primary = pgpkey.parent if not pgpkey.is_primary and pgpkey.parent is not None else pgpkey
+        uid = next(iter(primary.userids), None)
+        if uid is not None and uid.selfsig is not None and uid.selfsig.cipherprefs:
+            prefs = uid.selfsig.cipherprefs
+        else:
+            prefs = [SymmetricKeyAlgorithm.TripleDES]
+
+        usable = []
+        for alg in prefs:
+            try:
+                if alg.is_supported and not alg.is_insecure:
+                    usable.append(alg)
+            except NotImplementedError:
+                # algorithms like Plaintext have no cipher implementation at all
+                continue
+        return usable
+
+    @staticmethod
+    def _select_common_cipher(recipient_cipher_prefs):
+        """
+        Pick one symmetric cipher from the intersection of every recipient's preference lists.
+
+        No single algorithm or preference ordering is hard-coded. Each recipient contributes an
+        ordered preference list; the chosen cipher is the one whose worst (largest) rank across
+        all lists is smallest, i.e. the cipher that is as high as possible in *every* recipient's
+        list rather than the favorite of whoever happens to be listed first. Ties on worst rank
+        are broken by the cipher's algorithm identifier, so the outcome does not depend on the
+        order in which recipients were passed in. Ciphers absent from a recipient's list are
+        simply not in the intersection and can never be selected, which prevents silent
+        downgrading below any recipient's stated floor.
+
+        :raises: :py:exc:`~errors.PGPEncryptionError` if the intersection is empty
+        """
+        candidates = set(recipient_cipher_prefs[0])
+        for prefs in recipient_cipher_prefs[1:]:
+            candidates &= set(prefs)
+
+        if not candidates:
+            raise PGPEncryptionError(
+                "No supported symmetric algorithm is preferred by all recipients; "
+                "intersection of recipient preferences is empty")
+
+        def worst_rank(alg):
+            return max(prefs.index(alg) for prefs in recipient_cipher_prefs if alg in prefs)
+
+        return min(candidates, key=lambda alg: (worst_rank(alg), int(alg)))
+
     @staticmethod
     def dash_unescape(text):
         return re.subn(r'^- ', '', text, flags=re.MULTILINE)[0]
@@ -1234,6 +1330,76 @@ class PGPMessage(Armorable, PGPObject):
         else:
             msg |= self
 
+        return msg
+
+    def encrypt_for(self, recipients, hidden=False):
+        """
+        Encrypt this message once, to a group of public keys.
+
+        All recipients share the same integrity-protected (Tag 18) ciphertext protected by a
+        single library-generated session key; one Public-Key Encrypted Session Key (PKESK)
+        packet is produced per *distinct* receiving key. Passing the same actual receiving key
+        more than once - directly or as the selected subkey of several primary keys - never
+        adds a second packet for it.
+
+        :param recipients: The public keys (``PGPKey`` objects) to encrypt to. Primary keys are
+                           resolved to an encryption-capable component according to their usage
+                           flags: an encryption-marked primary key encrypts to itself, otherwise
+                           the first encryption-capable subkey is used.
+        :type recipients: iterable of :py:obj:`PGPKey`
+        :param hidden: If ``True``, every PKESK carries an all-zero eight-octet recipient field
+                       ("wildcard" Key ID) so the message does not reveal who can decrypt it.
+                       No mapping of the real Key IDs is stored anywhere in the envelope.
+        :type hidden: ``bool``
+        :raises: :py:exc:`TypeError` if a recipient is not a :py:obj:`PGPKey`
+        :raises: :py:exc:`~errors.PGPEncryptionError` if no recipients are supplied, a recipient
+                 has no RSA encryption component, or the intersection of the recipients'
+                 preferred symmetric algorithms is empty
+        :returns: A new :py:obj:`PGPMessage` containing one PKESK per distinct recipient and the
+                  single shared encrypted data packet. This message and the supplied keys are
+                  never modified.
+        """
+        recipients = list(recipients)
+        if len(recipients) == 0:
+            raise PGPEncryptionError("At least one recipient key is required")
+
+        # resolve every recipient to its actual receiving key component, de-duplicated by
+        # fingerprint so the same receiving key never gets a second PKESK
+        selected = collections.OrderedDict()
+        cipher_prefs = []
+        for recipient in recipients:
+            if not isinstance(recipient, PGPKey):
+                raise TypeError("recipients must be PGPKey objects, got {:s}".format(type(recipient).__name__))
+
+            pubkey = recipient.pubkey if not recipient.is_public else recipient
+            enc_key = self._select_encryption_key(pubkey)
+            if enc_key.fingerprint not in selected:
+                selected[enc_key.fingerprint] = enc_key
+                cipher_prefs.append(self._key_cipher_preferences(pubkey))
+
+        # the cipher must be executable here and appear in every recipient's preferences;
+        # an empty intersection is an error, not a warning
+        cipher_algo = self._select_common_cipher(cipher_prefs)
+        sessionkey = cipher_algo.gen_key()
+
+        # one integrity-protected data packet, shared by every recipient
+        skedata = IntegrityProtectedSKEDataV1()
+        skedata.encrypt(sessionkey, cipher_algo, self.__bytes__())
+
+        msg = PGPMessage()
+        for enc_key in selected.values():
+            pkesk = PKESessionKeyV3()
+            if hidden:
+                # wildcard Key ID: eight zero octets, with no out-of-band mapping
+                pkesk.encrypter = bytearray(8)
+            else:
+                pkesk.encrypter = bytearray(binascii.unhexlify(enc_key.fingerprint.keyid.encode('latin-1')))
+            pkesk.pkalg = enc_key.key_algorithm
+            # a fresh PKCS#1 encoding per recipient, even though the session key is shared
+            pkesk.encrypt_sk(enc_key._key, cipher_algo, sessionkey)
+            msg |= pkesk
+
+        msg |= skedata
         return msg
 
     def decrypt(self, passphrase):
@@ -2645,32 +2811,67 @@ class PGPKey(Armorable, ParentRef, PGPObject):
         """
         Decrypt a PGPMessage using this key.
 
+        Every public-key encrypted session key packet (PKESK) in the message is tried against
+        every private component of this key that could have wrapped it: the primary key and each
+        subkey whose usage flags allow encryption. A PKESK that names a specific Key ID is only
+        tried against the component carrying that Key ID, while a PKESK with an all-zero
+        ("wildcard") recipient field - produced by :py:meth:`PGPMessage.encrypt_for` with
+        ``hidden=True`` - is tried against every component.
+
+        A component whose wrapped session key cannot be recovered (e.g. the PKESK was wrapped
+        to a different key) is skipped, and so is a recovered session key that fails the data
+        integrity check on the encrypted data packet; the search continues with the remaining
+        combinations in packet order. Only a combination whose integrity check succeeds returns
+        the plaintext.
+
         :param message: An encrypted :py:obj:`PGPMessage`
         :raises: :py:exc:`~errors.PGPError` if the key is not private, or protected but not unlocked.
-        :raises: :py:exc:`~errors.PGPDecryptionError` if decryption fails for any other reason.
+        :raises: :py:exc:`~errors.PGPDecryptionError` if no combination decrypts and verifies the message.
         :returns: A new :py:obj:`PGPMessage` with the decrypted contents of ``message``.
         """
         if not message.is_encrypted:
             warnings.warn("This message is not encrypted", stacklevel=3)
             return message
 
-        if self.fingerprint.keyid not in message.encrypters:
-            sks = set(self.subkeys)
-            mis = set(message.encrypters)
-            if sks & mis:
-                skid = list(sks & mis)[0]
-                return self.subkeys[skid].decrypt(message)
+        # private components this key holds that might be able to open a PKESK:
+        # the primary key itself plus every encryption-capable subkey
+        candidates = [self]
+        candidates.extend(sk for sk in self.subkeys.values() if PGPMessage._has_encryption_flags(sk))
 
+        wildcard = '0000000000000000'
+        pkesks = [pkt for pkt in message._sessionkeys if isinstance(pkt, PKESessionKey)]
+
+        matched_any = False
+        # walk the packets in their on-wire order; for each packet try every holding component
+        # that it could belong to, so a wrong earlier packet never blocks a correct later one
+        for pkesk in pkesks:
+            for component in candidates:
+                if pkesk.encrypter != wildcard and pkesk.encrypter != component.fingerprint.keyid:
+                    continue
+
+                if pkesk.pkalg != component.key_algorithm:
+                    continue
+
+                matched_any = True
+                try:
+                    alg, key = pkesk.decrypt_sk(component._key)
+                    # only a session key that passes the integrity check is acceptable;
+                    # a failure here means this was not the right (packet, key) combination
+                    decmsg = PGPMessage()
+                    decmsg.parse(message.message.decrypt(key, alg))
+
+                except (TypeError, ValueError, IndexError, NotImplementedError, PGPDecryptionError):
+                    # IndexError covers short/garbage RSA unpadding from a non-matching key
+                    # (e.g. indexing into an empty decoded session-key blob)
+                    continue
+
+                return decmsg
+
+        if not matched_any:
+            # preserve the historical error for messages that name no key we hold
             raise PGPError("Cannot decrypt the provided message with this key")
 
-        pkesk = next(pk for pk in message._sessionkeys if pk.pkalg == self.key_algorithm and pk.encrypter == self.fingerprint.keyid)
-        alg, key = pkesk.decrypt_sk(self._key)
-
-        # now that we have the symmetric cipher used and the key, we can decrypt the actual message
-        decmsg = PGPMessage()
-        decmsg.parse(message.message.decrypt(key, alg))
-
-        return decmsg
+        raise PGPDecryptionError("Decryption failed: none of the available keys could decrypt and verify this message")
 
     def parse(self, data):
         unarmored = self.ascii_unarmor(data)
