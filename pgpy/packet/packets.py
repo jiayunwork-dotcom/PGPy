@@ -928,9 +928,9 @@ class PrivKeyV4(PrivKey, PubKeyV4):
 
     @property
     def unlocked(self):
-        if self.protected:
-            return 0 not in list(self.keymaterial)
-        return True  # pragma: no cover
+        # the keymaterial tracks the active unlock scopes itself, including
+        # across copies that share the same decrypted material
+        return self.keymaterial.unlocked
 
     def protect(self, passphrase, enc_alg, hash_alg):
         self.keymaterial.encrypt_keyblob(passphrase, enc_alg, hash_alg)
@@ -942,6 +942,10 @@ class PrivKeyV4(PrivKey, PubKeyV4):
         del passphrase
 
     def sign(self, sigdata, hash_alg):
+        # make sure private material is actually available before handing it
+        # to the crypto backend, so an expired unlock raises a clear error
+        # instead of a cryptic failure deep inside the backend
+        self.keymaterial._require_unlocked()
         return self.keymaterial.sign(sigdata, hash_alg)
 
 

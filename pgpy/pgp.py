@@ -1845,7 +1845,19 @@ class PGPKey(Armorable, ParentRef, PGPObject):
         Context manager method for unlocking passphrase-protected private keys. Has no effect if the key is not both
         private and passphrase-protected.
 
-        When the context managed block is exited, the unprotected private key material is removed.
+        Unlock scopes nest and are reference counted per private key packet:
+
+         - entering a scope only decrypts packets that are not already unlocked by an outer scope, so an inner
+           scope can never revoke the outer scope's access;
+         - exiting a scope only removes the plaintext of packets for which it was the last active scope, so the
+           outermost scope keeps working until it exits itself;
+         - a wrong passphrase (or any other failure while entering) rolls back only the holds acquired by this
+           attempt and never disturbs already-unlocked outer scopes or unencrypted subkeys;
+         - copies made with :py:func:`copy.copy` while unlocked share the decrypted material and therefore stay
+           usable until the last covering unlock scope exits, at which point the shared plaintext is wiped.
+
+        When the last context managed block covering a packet is exited, the unprotected private key material is
+        removed. Unencrypted (not passphrase-protected) key material is never touched.
 
         Example::
 
@@ -1883,16 +1895,35 @@ class PGPKey(Armorable, ParentRef, PGPObject):
             yield self
             return
 
+        # Every (still passphrase-protected) private packet gets exactly one hold from this scope. Packets that
+        # are already unlocked by an outer scope merely increment the shared holder counter; only the others are
+        # actually decrypted here. Unencrypted packets are skipped entirely so their material is never cleared.
+        acquired = []
         try:
             for sk in itertools.chain([self], self.subkeys.values()):
-                sk._key.unprotect(passphrase)
+                keymaterial = sk._key.keymaterial
+                if not keymaterial.s2k:
+                    # unencrypted subkey: nothing to unlock, nothing to clean up later
+                    continue
+
+                needs_decrypt = keymaterial._acquire_unlock()
+                acquired.append(keymaterial)
+                if needs_decrypt:
+                    sk._key.unprotect(passphrase)
             del passphrase
             yield self
 
-        finally:
-            # clean up here by deleting the previously decrypted secret key material
-            for sk in itertools.chain([self], self.subkeys.values()):
-                sk._key.keymaterial.clear()
+        except BaseException:
+            # entering the scope (or the body) failed: undo only the holds this attempt took out. Materials that
+            # an outer scope had already decrypted keep their remaining holder and stay usable.
+            for keymaterial in reversed(acquired):
+                keymaterial._release_unlock()
+            raise
+
+        else:
+            # normal exit: release each hold; the shared plaintext is zeroed only when the last holder goes
+            for keymaterial in reversed(acquired):
+                keymaterial._release_unlock()
 
     def add_uid(self, uid, selfsign=True, **prefs):
         """

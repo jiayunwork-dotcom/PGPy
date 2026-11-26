@@ -10,6 +10,7 @@ import hashlib
 import itertools
 import math
 import os
+import weakref
 
 try:
     import collections.abc as collections_abc
@@ -100,7 +101,8 @@ __all__ = ['SubPackets',
            'CipherText',
            'RSACipherText',
            'ElGCipherText',
-           'ECDHCipherText', ]
+           'ECDHCipherText',
+           '_UnlockState', ]
 
 
 class SubPackets(collections_abc.MutableMapping, Field):
@@ -1138,8 +1140,64 @@ class ECKDF(Field):
         return ckdf.derive(s)
 
 
+class _UnlockState(object):
+    """Shared unlock bookkeeping for one logical private key.
+
+    Every copy of a private key material instance points at the same state object. It counts how many unlock
+    scopes are currently allowed to use the decrypted material, so that:
+
+      * nested scopes on the original key or on any of its copies are all covered until the last one exits;
+      * a copy made while unlocked inherits the active scopes and cannot keep plaintext alive on its own;
+      * zeroing happens once, at the moment the final holder is released.
+    """
+    def __init__(self):
+        self.holders = 0
+        # weak references to every material instance sharing this state, so
+        # the last release can zero the plaintext in all of them without
+        # keeping dead copies alive on its own
+        self.instances = weakref.WeakSet()
+
+    @property
+    def unlocked(self):
+        return self.holders > 0
+
+    def acquire(self):
+        """Returns True if the encrypted blob still has to be decrypted."""
+        already_unlocked = self.holders > 0
+        self.holders += 1
+        return not already_unlocked
+
+    def release(self):
+        if self.holders <= 0:  # pragma: no cover - defensive
+            return
+        self.holders -= 1
+        if self.holders == 0:
+            # wipe every live instance that shares this state (original plus
+            # any outstanding copies); dead ones have left the WeakSet already
+            for instance in list(self.instances):
+                instance.clear()
+
+    def attach(self, material):
+        self.instances.add(material)
+
+
 class PrivKey(PubKey):
     __privfields__ = ()
+
+    # Maps each live private key material instance to the _UnlockState it belongs to. The state is deliberately
+    # not stored as an instance attribute (see test_04_copy, which requires copies to have independent
+    # attributes); weak keys also mean a key that is simply forgotten takes its bookkeeping with it instead of
+    # keeping an unlock record alive past its owner.
+    _unlock_registry = weakref.WeakKeyDictionary()
+
+    @property
+    def _unlock_state(self):
+        try:
+            return self._unlock_registry[self]
+        except KeyError:
+            state = _UnlockState()
+            self._unlock_registry[self] = state
+            return state
 
     @property
     def __mpis__(self):
@@ -1158,6 +1216,9 @@ class PrivKey(PubKey):
 
         for field in self.__privfields__:
             setattr(self, field, MPI(0))
+
+        # register this material with fresh unlock bookkeeping; copies share it via __copy__
+        self._unlock_state.attach(self)
 
     def __bytearray__(self):
         _bytes = bytearray()
@@ -1191,7 +1252,42 @@ class PrivKey(PubKey):
         pk.s2k = copy.copy(self.s2k)
         pk.encbytes = copy.copy(self.encbytes)
         pk.chksum = copy.copy(self.chksum)
+        if self.s2k and self._unlock_state.unlocked:
+            # copied while unlocked: the copy is covered by the same unlock
+            # scope(s) as the source and is wiped together with it when the
+            # last covering scope exits, so no plaintext outlives its scope
+            state = self._unlock_state
+            self._unlock_registry[pk] = state
+            state.attach(pk)
+        # a copy made while locked (or of unencrypted material) gets the
+        # fresh, independent state created lazily by the _unlock_state property
         return pk
+
+    @property
+    def unlocked(self):
+        """True while at least one unlock scope holds this decrypted material"""
+        if not self.s2k:
+            # unencrypted private keys are always available
+            return True
+        return self._unlock_state.unlocked
+
+    def _acquire_unlock(self):
+        """Record that one more unlock scope is using this material.
+
+        Returns True if the encrypted blob still has to be decrypted, and
+        False if an existing holder already decrypted it (nested unlock).
+        """
+        return self._unlock_state.acquire()
+
+    def _release_unlock(self):
+        """Release one unlock scope; wipe the plaintext when the last holder goes."""
+        self._unlock_state.release()
+
+    def _require_unlocked(self):
+        """Guard for operations that need usable private key material."""
+        if self.s2k and not self._unlock_state.unlocked:
+            raise PGPError("Key is passphrase-protected and has not been unlocked "
+                           "(or its unlock scope has already exited)")
 
     @abc.abstractmethod
     def __privkey__(self):
@@ -1235,6 +1331,9 @@ class PrivKey(PubKey):
         # delete pt and clear self
         del pt
         self.clear()
+        # protecting the material supersedes any previously decrypted state;
+        # from here on a fresh unlock is required again
+        self._unlock_state.holders = 0
 
     @abc.abstractmethod
     def decrypt_keyblob(self, passphrase):
@@ -1363,6 +1462,7 @@ class RSAPriv(PrivKey, RSAPub):
             del kb
 
     def sign(self, sigdata, hash_alg):
+        self._require_unlocked()
         return self.__privkey__().sign(sigdata, padding.PKCS1v15(), hash_alg)
 
 
@@ -1422,6 +1522,7 @@ class DSAPriv(PrivKey, DSAPub):
             del kb
 
     def sign(self, sigdata, hash_alg):
+        self._require_unlocked()
         return self.__privkey__().sign(sigdata, hash_alg)
 
 
@@ -1509,6 +1610,7 @@ class ECDSAPriv(PrivKey, ECDSAPub):
         self.s = MPI(kb)
 
     def sign(self, sigdata, hash_alg):
+        self._require_unlocked()
         return self.__privkey__().sign(sigdata, ec.ECDSA(hash_alg))
 
 
@@ -1561,6 +1663,7 @@ class EdDSAPriv(PrivKey, EdDSAPub):
         self.s = MPI(kb)
 
     def sign(self, sigdata, hash_alg):
+        self._require_unlocked()
         # GnuPG requires a pre-hashing with EdDSA
         # https://tools.ietf.org/html/draft-ietf-openpgp-rfc4880bis-06#section-14.8
         digest = hashes.Hash(hash_alg, backend=default_backend())
