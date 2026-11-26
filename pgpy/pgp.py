@@ -1731,6 +1731,83 @@ class PGPKey(Armorable, ParentRef, PGPObject):
 
         return key
 
+    @staticmethod
+    def _merge_signatures(dest, src):
+        # copy signatures from src into dest which dest does not already have.
+        # signatures are compared by their exact serialized bytes, so:
+        #  - merging the same material repeatedly never adds duplicate packets
+        #  - two signatures that differ in any byte are both kept, even if
+        #    their issuer and creation time are identical
+        have = {bytes(sig) for sig in dest._signatures}
+        for sig in list(src._signatures):
+            if sig.embedded:
+                # embedded signatures are serialized within their parent signature,
+                # so they travel along with it and are never merged on their own
+                continue
+
+            sbytes = bytes(sig)
+            if sbytes not in have:
+                have.add(sbytes)
+                dest |= copy.copy(sig)
+
+    def merge(self, other):
+        """
+        Merge the public key material of another copy of this key into this one.
+
+        This is a packet-level union of the two copies: User IDs, User Attributes, subkeys, and
+        signatures that are only present in ``other`` are copied into this key, while packets that
+        are already present (compared by their exact serialized bytes) are kept only once. This
+        means that merging the same copies in any order, or merging the same copy repeatedly,
+        always results in the same set of packets.
+
+        Only public keys can be merged, and only with another copy of the same key; neither
+        ``self`` nor ``other`` is required to be a primary key. ``other`` is never modified -
+        packets that need to be added to this key are copied first.
+
+        :param other: The :py:obj:`PGPKey` to merge into this one.
+        :type other: :py:obj:`PGPKey`
+        :raises: :py:exc:`TypeError` if ``other`` is not a :py:obj:`PGPKey`
+        :raises: :py:exc:`ValueError` if either key is a private key, or if the two keys do not
+                 have the same fingerprint
+        :returns: ``self``
+        """
+        if not isinstance(other, PGPKey):
+            raise TypeError("unsupported operand type(s) for merge: '{:s}' and '{:s}'"
+                            "".format(self.__class__.__name__, other.__class__.__name__))
+
+        if other is self:
+            return self
+
+        if not (self.is_public and other.is_public):
+            raise ValueError('only public keys can be merged')
+
+        if self.fingerprint != other.fingerprint:
+            raise ValueError('cannot merge keys with different fingerprints')
+
+        # signatures on the key itself (direct-key signatures, revocation signatures, ...)
+        self._merge_signatures(self, other)
+
+        # user ids and user attributes, matched by their packet contents
+        for ouid in other._uids:
+            obytes = bytes(ouid._uid)
+            match = next((uid for uid in self._uids if bytes(uid._uid) == obytes), None)
+            if match is None:
+                self |= copy.copy(ouid)
+
+            else:
+                self._merge_signatures(match, ouid)
+
+        # subkeys, matched by fingerprint
+        for osub in other.subkeys.values():
+            match = self._children.get(osub.fingerprint.keyid)
+            if match is not None and match.fingerprint == osub.fingerprint:
+                match.merge(osub)
+
+            else:
+                self |= copy.copy(osub)
+
+        return self
+
     def protect(self, passphrase, enc_alg, hash_alg):
         """
         Add a passphrase to a private key. If the key is already passphrase protected, it should be unlocked before
@@ -2687,6 +2764,9 @@ class PGPKeyring(collections_abc.Container, collections_abc.Iterable, collection
         self._pubkeys = collections.deque()
         self._privkeys = collections.deque()
         self._aliases = collections.deque([{}])
+        # fingerprints of primary keys loaded with merge=True, mapped to the id of the
+        # single keyring-owned PGPKey that holds their merged public key material
+        self._merged = {}
         self.load(*args)
 
     def __contains__(self, alias):
@@ -2785,23 +2865,44 @@ class PGPKeyring(collections_abc.Container, collections_abc.Iterable, collection
             for subkey in pgpkey.subkeys.values():
                 self._add_key(subkey)
 
-    def load(self, *args):
+    @staticmethod
+    def _iter_load_args(args):
+        # flatten args, where each arg may be a single item or a list/tuple of items
+        for ilist in args:
+            for item in (ilist if isinstance(ilist, (tuple, list)) else [ilist]):
+                yield item
+
+    def load(self, *args, **kwargs):
         r"""
         Load all keys provided into this keyring object.
 
         :param \*args: Each arg in ``args`` can be any of the formats supported by :py:meth:`PGPKey.from_file` and
                       :py:meth:`PGPKey.from_blob` or a :py:class:`PGPKey` instance, or a ``list`` or ``tuple`` of these.
         :type \*args: ``list``, ``tuple``, ``str``, ``unicode``, ``bytes``, ``bytearray``
+        :keyword merge: If ``True``, public keys are imported incrementally: all copies of a primary key
+                        (identified by its full fingerprint) are merged into a single keyring-owned view
+                        that retains the User IDs, subkeys, and signatures of every copy, and any public
+                        copies of that primary key already loaded are absorbed into it. The whole call is
+                        rejected - leaving the keyring unchanged - if any input fails to parse or contains
+                        private key material. Defaults to ``False``, which preserves the historical
+                        behavior of storing every loaded key as-is.
+        :type merge: ``bool``
         :returns: a ``set`` containing the unique fingerprints of all of the keys that were loaded during this operation.
         """
+        merge = kwargs.pop('merge', False)
+        if kwargs:
+            raise TypeError('unexpected keyword argument(s): {:s}'.format(', '.join(sorted(kwargs))))
+
+        if merge:
+            return self._load_merge(args)
+
         def _preiter(first, iterable):
             yield first
             for item in iterable:
                 yield item
 
         loaded = set()
-        for key in iter(item for ilist in iter(ilist if isinstance(ilist, (tuple, list)) else [ilist] for ilist in args)
-                        for item in ilist):
+        for key in self._iter_load_args(args):
             keys = {}
             if isinstance(key, PGPKey):
                 _key = key
@@ -2815,6 +2916,95 @@ class PGPKeyring(collections_abc.Container, collections_abc.Iterable, collection
                 loaded |= {ik.fingerprint} | {isk.fingerprint for isk in ik.subkeys.values()}
 
         return list(loaded)
+
+    @staticmethod
+    def _check_mergeable(pgpkey):
+        # a key can only take part in a merge if it parsed into actual public key material
+        for key in [pgpkey] + list(pgpkey.subkeys.values()):
+            if key._key is None:
+                raise ValueError('cannot merge: input did not contain a usable public key')
+
+            if not key.is_public:
+                raise ValueError('cannot merge: merge=True only supports public keys, '
+                                 'but private key material was provided')
+
+    def _load_merge(self, args):
+        # phase 1: parse and validate every input before touching any keyring state, so that
+        # a failure anywhere rejects the whole call and leaves contents and index unchanged.
+        staged = []
+        for item in self._iter_load_args(args):
+            owned = True
+            if isinstance(item, PGPKey):
+                keys = [item]
+                owned = False
+            elif os.path.isfile(item):
+                _key, others = PGPKey.from_file(item)
+                keys = [_key] + [k for k in others.values() if k is not _key]
+            else:
+                _key, others = PGPKey.from_blob(item)
+                keys = [_key] + [k for k in others.values() if k is not _key]
+
+            for pgpkey in keys:
+                self._check_mergeable(pgpkey)
+                # the keyring only ever stores key material it owns: keys parsed here are already
+                # private to this call, and caller-owned PGPKey objects are copied now (while this
+                # call can still fail cleanly) so that merging can never modify them
+                staged.append(pgpkey if owned else copy.copy(pgpkey))
+
+        # phase 2: group copies by primary fingerprint, preserving first-seen order
+        groups = collections.OrderedDict()
+        for pgpkey in staged:
+            groups.setdefault(pgpkey.fingerprint, []).append(pgpkey)
+
+        # phase 3: commit. All inputs are known-good public keys at this point, so contents
+        # and lookup index are updated together and cannot be left half-applied.
+        loaded = []
+        for fp, copies in groups.items():
+            target = self._keys.get(self._merged.get(fp))
+            fresh = target is None
+            if fresh:
+                target = copies.pop(0)
+                self._merged[fp] = id(target)
+
+            for other in copies:
+                target.merge(other)
+
+            # absorb any other public copies of this primary key already in the keyring
+            # (e.g. loaded earlier without merge), so one fingerprint has exactly one view
+            for pkid in [pkid for pkid in self._pubkeys
+                         if pkid != id(target) and self._keys[pkid].fingerprint == fp]:
+                stale = self._keys[pkid]
+                target.merge(stale)
+                self.unload(stale)
+
+            if fresh:
+                self._add_key(target)
+            else:
+                self._index_key(target)
+
+            loaded.append(target.fingerprint)
+            loaded.extend(subkey.fingerprint for subkey in target.subkeys.values())
+
+        return loaded
+
+    def _index_key(self, pgpkey):
+        # (re)index the aliases of a key that is already loaded, picking up any User IDs and
+        # subkeys that a merge may have added to it since it was first loaded
+        pkid = id(pgpkey)
+        self._add_alias(pgpkey.fingerprint, pkid)
+        self._add_alias(pgpkey.fingerprint.keyid, pkid)
+        self._add_alias(pgpkey.fingerprint.shortid, pkid)
+        for uid in pgpkey.userids:
+            self._add_alias(uid.name, pkid)
+            if uid.comment:
+                self._add_alias(uid.comment, pkid)
+
+            if uid.email:
+                self._add_alias(uid.email, pkid)
+
+        for subkey in pgpkey.subkeys.values():
+            if id(subkey) not in self._keys:
+                self._add_key(subkey)
 
     @contextlib.contextmanager
     def key(self, identifier):
@@ -2873,6 +3063,11 @@ class PGPKeyring(collections_abc.Container, collections_abc.Iterable, collection
             [ kd.remove(pkid) for kd in [self._pubkeys, self._privkeys] if pkid in kd ]
             # remove the key
             self._keys.pop(pkid)
+
+            # forget merge-view bookkeeping that points at the unloaded key
+            for fp, mpkid in list(self._merged.items()):
+                if mpkid == pkid:
+                    self._merged.pop(fp)
 
             # remove aliases
             for m, a in [ (m, a) for m in self._aliases for a, p in m.items() if p == pkid ]:
